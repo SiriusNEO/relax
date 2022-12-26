@@ -177,40 +177,22 @@ In Relax, like many other programming languages, variables and expressions (or v
 To show the point, again consider E.g. 1.1. Recall that we get `x_adjoint` and `y_adjoint` by these calculations.
 
 ```python
-x_adjoint: Tensor((5, 5), "float32")   =  R.collapse_sum_to(lv0_adjoint, (5, 5))
-y_adjoint: Tensor((5, 5), "float32")   =  R.collapse_sum_to(lv0_adjoint, (5, 5))
+x_adjoint: Tensor((5, 5), "float32") = R.collapse_sum_to(lv0_adjoint, (5, 5))
+y_adjoint: Tensor((5, 5), "float32") = R.collapse_sum_to(lv0_adjoint, (5, 5))
 ```
 
 If `lv0_adjoint` is not a relax Var but a relax Expr, they can be further expanded:
 
 ```python
-x_adjoint: Tensor((5, 5), "float32")   =  R.collapse_sum_to(
-											R.broadcast_to(gv0_adjoint, (5, 5)),
-											(5, 5)
-										)
-y_adjoint: Tensor((5, 5), "float32")   =  R.collapse_sum_to(
-											R.broadcast_to(gv0_adjoint, (5, 5)),
-											(5, 5)
-										)
+x_adjoint: Tensor((5, 5), "float32") = R.collapse_sum_to(R.broadcast_to(gv0_adjoint, (5, 5)), (5, 5))
+y_adjoint: Tensor((5, 5), "float32") = R.collapse_sum_to(R.broadcast_to(gv0_adjoint, (5, 5)), (5, 5))
 ```
 
 And also suppose `gv0_adjoint` is a Expr
 
 ```python
-x_adjoint: Tensor((5, 5), "float32")   =  R.collapse_sum_to(
-										      R.broadcast_to(
-										        R.ones((), dtype="float32"),
-                                            	(5, 5)
-                                              ),
-											(5, 5)
-										)
-y_adjoint: Tensor((5, 5), "float32")   =  R.collapse_sum_to(
-										      R.broadcast_to(
-										        R.ones((), dtype="float32"),
-                                            	(5, 5)
-                                              ),
-											(5, 5)
-										)
+x_adjoint: Tensor((5, 5), "float32") = R.collapse_sum_to(R.broadcast_to(R.ones((), dtype="float32"),(5, 5)), (5, 5))
+y_adjoint: Tensor((5, 5), "float32") = R.collapse_sum_to(R.broadcast_to(R.ones((), dtype="float32"), (5, 5)), (5, 5))
 ```
 
 After another normalizing, many redundant relax variables will be created and it is catastrophic. Therefore it is important for us to use relax Var to store our intermediate calculation results. The following is the simple and clean version we want.
