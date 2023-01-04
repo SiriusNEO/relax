@@ -4,7 +4,7 @@
 
 Implementation Details of the experimental `Gradient` Pass in Relax.
 
-Updated: 2022/12/27
+Updated: 2023/1/4
 
 # 1. Code and API
 
@@ -16,11 +16,11 @@ The pass differentiates the input relax function and return a fresh new differen
 @I.ir_module
 class Before:
     @R.function
-    def main(x: Tensor((5, 5), "float32"),
-            y: Tensor((5, 5), "float32")):
+    def main(x: R.Tensor((5, 5), "float32"),
+            y:  R.Tensor((5, 5), "float32")):
         with R.dataflow():
-            lv0 = relax.add(x, y)
-            gv0 = relax.sum(lv0)
+            lv0 = R.add(x, y)
+            gv0 = R.sum(lv0)
             R.output(gv0)
         return gv0
 
@@ -638,5 +638,45 @@ if binding->value is TupleGetItem:
     adjoint_expr_map_[tuple_var] = AdditionInTuple(
         adjoint_expr_map_[tuple_var], # a_adjoint_expr: Tuple
         binding->value->index, adjoint_expr)
+```
+
+
+
+# Q&A of Some Logic
+
+## UpdateExprMap and Addition
+
+There is no duplicate logic in these two methods. (It looks like because they all have a recursively tuple-aware logic.)
+
+- UpdateExprMap is to deal with all leaves
+
+  For a call `d = op(a, b, c)`, we should do
+
+  ```
+  UpdateExprMap(a, d_adjoint) 
+  UpdateExprMap(b, d_adjoint)
+  UpdateExprMap(c, d_adjoint)
+  ```
+
+  Here we don't know what is `a/b/c`. Under the assumption of normalization, it can be all relax leaf nodes.
+
+- Addition is just a tuple-aware AD (since `relax.add` does not support Tuple)
+
+## Expr and Var
+
+To show the problem clearly, here is an example:
+
+```c++
+@I.ir_module
+class Before:
+    @R.function
+    def main(x: R.Tensor((3, 3), "float32")):
+        with R.dataflow():
+            lv1 = x
+            lv2 = R.add(lv1, x)
+            lv3 = R.add(lv2, lv1)
+            lv4 = R.sum(lv3)
+            R.output(lv4)
+        return lv4
 ```
 
