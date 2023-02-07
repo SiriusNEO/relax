@@ -4,86 +4,101 @@
 
 Implementation Details of the experimental `Gradient` Pass in Relax.
 
-Updated: 2023/1/4
+Updated: 2023/2/7
 
-# 1. Code and API
+# 1. <span id="c1">Code and API</span>
+
+## Code Organization
+
+The pass is in `src/relax/transform/gradient.cc` , with the Python API in `python/relax/transform/transform.py`.
+
+The gradients of operators are registered in `python/relax/op/_op_gradient.py`.
+
+## Transformation
 
 The pass differentiates the input relax function and return a fresh new differentiated function, with the name `<original_name>_adjoint`. It returns both the original return value and the needed adjoints in the form of Tuple. See the following example:
-
-**E.g. 1.1:**
 
 ```python
 @I.ir_module
 class Before:
     @R.function
-    def main(x: R.Tensor((5, 5), "float32"),
-            y:  R.Tensor((5, 5), "float32")):
+    def main(
+        x: R.Tensor((5, 5), dtype="float32"), y: R.Tensor((5, 5), dtype="float32")
+    ) -> R.Tensor((), dtype="float32"):
         with R.dataflow():
-            lv0 = R.add(x, y)
-            gv0 = R.sum(lv0)
+            lv0: R.Tensor((5, 5), dtype="float32") = R.add(x, y)
+            gv0: R.Tensor((), dtype="float32") = R.sum(lv0, axis=None, keepdims=False)
             R.output(gv0)
         return gv0
 
 @I.ir_module
-class Module:
+class After:
     @R.function
-    def main(x: Tensor((5, 5), "float32"), y: Tensor((5, 5), "float32")) -> 
-            Tuple(
-                Tensor(None, "float32", ndim = 0), 
-                Tuple(
-                    Tensor(None, "float32", ndim = 2),
-                    Tensor(None, "float32", ndim = 2)
-                )
-            ):
+    def main(
+        x: R.Tensor((5, 5), dtype="float32"), y: R.Tensor((5, 5), dtype="float32")
+    ) -> R.Tensor((), dtype="float32"):
         with R.dataflow():
-            lv0: Tensor((5, 5), "float32")         =  R.add(x, y)
-            gv0: Tensor((), "float32")             =  R.sum(lv0)
-            gv0_adjoint: Tensor((), "float32")     =  R.ones((), dtype="float32")
-            lv0_adjoint: Tensor((5, 5), "float32") =  R.broadcast_to(gv0_adjoint, (5, 5))
-            x_adjoint: Tensor((5, 5), "float32")   =  R.collapse_sum_to(lv0_adjoint, (5, 5))
-            y_adjoint: Tensor((5, 5), "float32")   =  R.collapse_sum_to(lv0_adjoint, (5, 5))
+            lv0: R.Tensor((5, 5), dtype="float32") = R.add(x, y)
+            gv0: R.Tensor((), dtype="float32") = R.sum(lv0, axis=None, keepdims=False)
+            R.output(gv0)
+        return gv0
+
+    @R.function
+    def main_adjoint(
+        x: R.Tensor((5, 5), dtype="float32"), y: R.Tensor((5, 5), dtype="float32")
+    ) -> R.Tuple(
+        R.Tensor((), dtype="float32"),
+        R.Tuple(R.Tensor((5, 5), dtype="float32"), R.Tensor((5, 5), dtype="float32")),
+    ):
+        with R.dataflow():
+            lv0: R.Tensor((5, 5), dtype="float32") = R.add(x, y)
+            gv0: R.Tensor((), dtype="float32") = R.sum(lv0, axis=None, keepdims=False)
+            gv0_adjoint: R.Tensor((), dtype="float32") = R.ones((), dtype="float32")
+            lv0_adjoint: R.Tensor((5, 5), dtype="float32") = R.broadcast_to(
+                gv0_adjoint, (5, 5)
+            )
+            x_adjoint: R.Tensor((5, 5), dtype="float32") = lv0_adjoint
+            y_adjoint: R.Tensor((5, 5), dtype="float32") = lv0_adjoint
             R.output(gv0, x_adjoint, y_adjoint)
         return (gv0, (x_adjoint, y_adjoint))
 ```
 
+There are some important design points of this AD Pass.
+
+- It is IRModule to IRModule. The target function `main` is preserved in new module and new differentiated function `main_adjoint` is added to the module.
+- The `main_adjoint` contains the original part (forward part) of `main` and appends new adjoint bindings after.
+- `main_adjoint` returns a pair `(orig_ret, grads)`. `orig_ret` is the return value of `main`. And `grads` is the adjoints of specified arguments. For each argument of the original call in `require_grads`, the pass stores its partial in the corresponding position (in order).
 
 
-## Code Organization
 
-The pass is in `src/relax/transform/gradient.cc` , with the Python API in `relax/transform/transform.py`.
+## Restrictions
 
-## Requirements
-
-Currently AD can only work in:
+### R1. Currently AD can only work in:
 
 - A relax function with a **single dataflow-block**.
 - The function's body should be `SeqExpr` 
-- The return value should be a `scalar`.
+- The return value should be a `Scalar`.
 
-Currently considered AST nodes:
+### R2. Currently considered AST nodes:
 
 - [x] Primitive Call
 - [x] Assignment
 - [x] Tuple-aware (Tuple, TupleGetItem)
-- [ ] Constant
+- [x] Constant
 - [ ] Match Shape
 - [ ] Call TIR
 
-AD uses the following operators:
+### R3. AD uses the following built-in operators:
 
 - `relax.zeros`
 - `relax.ones`
 - `relax.add`
 
-The gradient should be registered as an attribute of the operator, which `attr_key` is `FPrimalGradient`. The type of the gradient is
+### R4. Gradients of Operators
 
-```c++
-FPrimalGradient = runtime::TypedPackedFunc<tvm::Array<Expr>(const Expr& orig_call, const Expr& output_grad)>;
-```
+The gradients of operators presented in the module must be registered properly. See [2. Gradients of Operators](#c2) for details.
 
-It returns an Array which has the same size with the arguments of the call. For each argument of the original call, the Array stores its partial in the corresponding position.
 
-Before the Module is fed into this pass, it should be **normalized**.
 
 ## API
 
@@ -98,113 +113,141 @@ TVM_DLL Pass Gradient(GlobalVar global_var, Optional<Array<Var>> require_grads);
 
 
 
-# 2. Simplest Case: AD with Only Primitive Operators
+# 2. <span id="c2">Gradients of Operators</span>
 
-## Goal
+The gradient is registered as an attribute of the operator, which `attr_key` is `FPrimalGradient`. The type of the gradient is
 
-Our goal is to calculate the adjoints for inputs (by default or specified by `require_grads`) in respect of **target** (the return value of the original function). For instance, in E.g. 1.1, the adjoint of x can be defined as
-$$
-\text{x_adjoint} = \frac{\partial\text{gv0}}{\partial \text{x}}
-$$
+```c++
+using FPrimalGradient = runtime::TypedPackedFunc<tvm::Array<Expr>(
+    const Var& orig_var, const Call& orig_call, const Var& output_grad, const BlockBuilder& ctx)>;
+```
 
-
-## Starting by Calculating an Example
-
-Let us consider E.g. 1.1 again. In this example, the target gv0 is scalar, which satisfies our requirements. We set the adjoint of target at first preparing for propagation.
+For example, the gradient of `relax.tanh` can be written as
 
 ```python
-gv0_adjoint: Tensor((), "float32")     =  R.ones((), dtype="float32") # gv0_adjoint = 1
-```
+@register_gradient("relax.tanh")
+def tanh_grad(
+    orig_var: Var,
+    orig_call: Call,
+    output_grad: Var,
+    ctx: BlockBuilder,
+):
+    """Gradient of tanh.
 
-Because it is a reverse-mode AD, we start from the last binding, which is
+    Forward Form:
+        y = relax.tanh(x)
 
-```
-gv0 = relax.sum(lv0)
-```
-
-And we search the gradient corresponding to `relax.sum` by the attribute `FPrimalGradient`. For simplicity, here we can regard the gradient of `sum` is just
-
-```python
-@register_gradient("relax.sum")
-def sum_grad(orig: Call, grad: Var):
-    """Gradient of sum."""
-    return [broadcast_to(grad, orig.args[0].shape)]
-```
-
-Then we call `sum_grad` by passing orignal call and `gv0_adjoint` to it.
-
-```
-lv0_adjoint += sum_grad(call, gv0_adjoint)[0]
-```
-
-Since `lv0_adjoint` has not been defined here, `+=` can be replaced with `=` in implementation. Then we get the `lv_adjoint=ones((5, 5))` .
-
-Then we can go to the next binding
-
-```
-lv0 = relax.add(x, y)
-```
-
-The gradient of `relax.add` is also very clear
-
-```python
-@register_gradient("relax.add")
-def add_grad(orig: Call, grad: Var):
-    """Returns [grad, grad]."""
+    Backward:
+        Returns [y_grad * (1 - y * y)].
+    """
+    x_ones = ones(_get_shape(orig_call.args[0]), orig_call.args[0].struct_info.dtype)
     return [
-        collapse_sum_to(grad, orig.args[0].shape), 
-        collapse_sum_to(grad, orig.args[1].shape)
-      ]
+        multiply(
+            output_grad,
+            subtract(x_ones, multiply(orig_var, orig_var)),
+        )
+    ]
 ```
 
-Note that it is necessary to use a `collapse_sum_to` since `relax.add` is a broadcast operator. We can regard `collapse_sum_to` as the opposite of broadcasting. Then we have
+Some illustrations about the gradient registering.
+
+### I1. Arguments of the gradient function
+
+Currently we have four arguments
 
 ```
-x_adjoint += add_grad(call, lv0_adjoint)[0]
-y_adjoint += add_grad(call, lv0_adjoint)[0]
+orig_var: Var, orig_call: Call, output_grad: Var, ctx: BlockBuilder
 ```
 
-Finally AD ends with the return (Suppose we do not specify `require_grads`)
-
 ```
-return (gv0, (x_adjoint, y_adjoint))
+y = relax.tanh(x)
 ```
 
-## Expr and Var
+- `orig_call` is the orginal call expr which we want to differentiate, which is `Call(relax.tanh, [x,], ...)`. The inputs can be fetched by this Call expr,
 
-In Relax, like many other programming languages, variables and expressions (or values) are separated. The correct way we implement our AD should be: Allocate Vars for every adjoints, calculate the value of adjoints in Expr, using these adjoints in the form of Vars and finally bind & emit every pair of Var and Expr.
+- `output_grad` is the gradient of RHS, which is supposed to be `y_adjoint`.
 
-To show the point, again consider E.g. 1.1. Recall that we get `x_adjoint` and `y_adjoint` by these calculations.
+- `orig_var` is `y`. It is passed to saving some calculations. In this example, using `y` can prevent us from recalculating `tanh(x)`. 
+
+- `ctx` is the context which is not used right now. But we believe it is useful when it comes to dynamic shape cases and when we need to emit some bindings or do some normalizations.
+
+### I2. Collapse_Sum
+
+Because broadcasting happens in the forward calculations, we need an opposite operator of `broadcast` when we go backward. In tvm codebase we call this operator `collapse_sum` and it is important in AD. And we use it when differentiating these broadcasting operators.
+
+If we have enough information to prove shape equality, we can eliminate some `collapse_sum` in the gradient function.
+
+```
+c = relax.add(a, b)
+a_adjoint = relax.collapse_sum_to(c_adjoint, a.shape)
+# If we can prove a.shape == c_adjoint.shape, this collapse_sum_to is unnecessary.
+```
+
+
+
+### I3. Some problems
+
+Here are some problems which are not handled well now. Some of this problems relate to the limitations of `topi` and current relax supports.
+
+-  Dynamic Shape / Shape Var
+- Complicated NN Operators
+
+
+
+# 3. <span id="c3">Simplest Case: AD with Only Primitive Operators</span>
+
+In this simplest case, we only consider two types of bindings: Call and Assignment. And we can give the first version AD
+
+### V1: Simplest Case AD
 
 ```python
-x_adjoint: Tensor((5, 5), "float32") = R.collapse_sum_to(lv0_adjoint, (5, 5))
-y_adjoint: Tensor((5, 5), "float32") = R.collapse_sum_to(lv0_adjoint, (5, 5))
+def AD():
+    for binding in reverse_order:
+        adjoint_var = Var()
+        adjoint_var_map_[binding->var] = adjoint_var
+
+        if binding->var not in adjoint_expr_map_: # irrelevant parts or target
+            if binding->var == target:
+                adjoint_expr_map_[binding->var] = 1 # target
+            else:
+                continue # irrelevant parts
+
+        adjoint_expr = adjoint_expr_map_[binding->var]
+        emit_and_bind(adjoint_var, adjoint_expr) # emit and bind
+
+        call = cast<Call>(binding->value) # in this case value can only be call
+        gradient = gradient_map[call->op]
+        partials = gradient(call, adjoint_var) 
+        # AD. Note that we pass the adjoint_var to it instead of adjoint_expr !!!
+    
+    for i in len(call.args):
+        arg = call.args[i]
+        partial = partials[i]
+        update_adjoint(arg, partial)
+
+def update_adjoint(arg, partial)
+    if arg not in adjoint_expr_map_:
+    	adjoint_expr_map_[arg] = partial # frist update
+    else:
+    	adjoint_expr_map_[arg] += partial
+
+# It is clear that after the for, we have adjoint_expr for each input.
+# Then we just need to bind them with adjoint_var and emit them.
 ```
 
-If `lv0_adjoint` is not a relax Var but a relax Expr, they can be further expanded:
+There are some points about the first version AD.
 
-```python
-x_adjoint: Tensor((5, 5), "float32") = R.collapse_sum_to(R.broadcast_to(gv0_adjoint, (5, 5)), (5, 5))
-y_adjoint: Tensor((5, 5), "float32") = R.collapse_sum_to(R.broadcast_to(gv0_adjoint, (5, 5)), (5, 5))
-```
+### P1. Expr and Var of Adjoints
 
-And also suppose `gv0_adjoint` is a Expr
+In Relax, like many other programming languages, variables and expressions (or values) are separated. And if we don't handle this issue well, unnecessary calculations appear in the transformed module.
 
-```python
-x_adjoint: Tensor((5, 5), "float32") = R.collapse_sum_to(R.broadcast_to(R.ones((), dtype="float32"),(5, 5)), (5, 5))
-y_adjoint: Tensor((5, 5), "float32") = R.collapse_sum_to(R.broadcast_to(R.ones((), dtype="float32"), (5, 5)), (5, 5))
-```
+The correct way we implement our AD should be: 
 
-After another normalizing, many redundant relax variables will be created and it is catastrophic. Therefore it is important for us to use relax Var to store our intermediate calculation results. The following is the simple and clean version we want.
+- Allocate Vars for every adjoints. For a Var `a` in forward, we allocate a new Var `a_adjoint` as its adjoint. To separate Expr and Var, we can let `a_adjoint_var` be this var and `a_adjoint_expr` be the corresponding calculated Expr.
+- Calculate the value of adjoints in Expr using these adjoints in the form of Vars. For example, if a propagation rule is `c_adjoint = a_adjoint + b_adjoint`, we should write as `c_adjoint_expr = Call(add, [a_adjoint_var, b_adjoint_var])` .
+- Bind and emit every pair of Var and Expr.
 
-```python
-gv0_adjoint: Tensor((), "float32")     =  R.ones((), dtype="float32")
-lv0_adjoint: Tensor((5, 5), "float32") =  R.broadcast_to(gv0_adjoint, (5, 5))
-x_adjoint: Tensor((5, 5), "float32")   =  R.collapse_sum_to(lv0_adjoint, (5, 5))
-y_adjoint: Tensor((5, 5), "float32")   =  R.collapse_sum_to(lv0_adjoint, (5, 5))
-```
-
-Hence in practice, we need two Maps: one for Var and another for Expr.
+In practice, we need two Maps: one for Var and another for Expr.
 
 ```c++
 // var to its adjoints var
@@ -224,11 +267,15 @@ As stated before, if it is the first time we update to v, `+=` becomes `=` :
 adjoint_expr_map_.Set(v, increment)
 ```
 
+### P2. Assignment
 
+```
+b = a
+```
 
-## About Irrelevant Parts
+"Assignment" is not a call, but it can be viewed as an "identity" operator. The logic to handle this case is similar.
 
-**E.g. 1.2:**
+### P3. About Irrelevant Parts
 
 ```python
 @I.ir_module
@@ -249,57 +296,18 @@ In this example, `lv1`, `lv2` has no contributions to `gv0`. So mathematically
 $$
 \frac{\partial\text{gv0}}{\partial \text{lv1}} = \frac{\partial\text{gv0}}{\partial \text{lv2}} = 0
 $$
-which means  `lv1_adjoint` and `lv2_adjoint` has no contributions to `x`, `y` and any other parts. So for these irrelevant parts, we can safely just ignore them when doing AD.
+which means  `lv1_adjoint` and `lv2_adjoint` has no contributions to `x`, `y` and any other parts. So for these irrelevant parts, we can safely just ignore them when doing AD. "Ignore" means when we visit these bindings,
 
-
-
-## Summarization
-
-To sum up, we can write some pseudo code (in Python-like syntax) to describe this simplest case,
-
-**AD-Version 1.**
-
-```python
-for binding in reverse_order:
-	adjoint_var = Var()
-    adjoint_var_map_[binding->var] = adjoint_var
-    
-    if binding->var not in adjoint_expr_map_: # irrelevant parts or target
-        if binding->var == target:
-            adjoint_expr_map_[binding->var] = 1 # target
-        else:
-            continue # irrelevant parts
-            
-    adjoint_expr = adjoint_expr_map_[binding->var]
-    emit_and_bind(adjoint_var, adjoint_expr) # emit and bind
-            
-    call = cast<Call>(binding->value) # in this case value can only be call
-    gradient = gradient_map[call->op]
-    partials = gradient(call, adjoint_var) 
-    # AD. Note that we pass the adjoint_var to it instead of adjoint_expr !!!
-    
-    for i in len(call.args):
-        arg = call.args[i]
-        partial = partials[i]
-        if arg not in adjoint_expr_map_:
-            adjoint_expr_map_[arg] = partial # frist update
-        else:
-            adjoint_expr_map_[arg] += partial
-
-# It is clear that after the for, we have adjoint_expr for each input.
-# Then we just need to bind them with adjoint_var and emit them.
+```
+lv1 = relax.sub(x, y)
+lv2 = relax.sum(lv1)
 ```
 
+we can just do nothing and return.
 
 
-PS: "assignment" is not a call. But it can be viewed as an "identity" operator. The logic to handle this case is similar. Always be care with the "expr and var" issue. How to check whether a binding is a assignment? Just check whether `binding->value` is a Var.
 
-```python
-# a = b
-adjoint_expr_map_[b] += adjoint_var_map_[a]
-```
-
-
+### P4. Some Interesting Views
 
 We can conclude some interesting and reasonable rules for AD. First, in a horizontal view, focus on a single binding
 
@@ -335,29 +343,43 @@ If there is a def but not used, it must have no contribution to target so (in "A
 
 
 
-# 3. Tuple-Aware AD
+# 4. <span id="c4">Tuple-Aware AD</span>
 
-## Intro
+In this case we need to consider not only Tensor but also Tuple. Two new types of bindings are introduced:
 
-In this case we need to consider not only Tensor but also Tuple. Two new expressions are introduced:
+- relax.Tuple (Tuple Definition): `c = (a, b)`
+- relax.TupleGetItem:  `b = a[0]`
 
-- Tuple (definition): `c = (a, b)`
-- TupleGetItem `b = a[0]`
+Before we start to handle Tuple in AD, there are some important facts about Tuple in Relax:
 
-In Relax specification, after normalization, we can have nested Tuple definition (`c = ((a, b), (e,))`) but not nested Tuple GetItem (`c = b[1][2] `).
+### F1: Leaf Nodes
 
-An important fact is that the adjoint of a Tuple has **exactly the same shape (structural info)** with the original Tuple. We can conclude the basic idea as:
-
-**E.g. 3.1:**
+In Relax specification, `Tuple` is a leaf but `TupleGetItem` is not. Therefore after normalization, we can have nested Tuple definition but not nested TupleGetItem.
 
 ```
+c = ((a, b), (e,)) # OK
+c = b[1][2]
+```
+
+### F2: Struct Info Relation
+
+The adjoint of a Tuple has **exactly the same struct info** (both the nested structure and the leaf sinfo of the tuple info) with the original Tuple. According to this relation, we can conclude a basic idea of tuple-aware AD as:
+
+- Tuple Definition
+
+```python
 Before:
 c = (a, b)
 
 After:
 a_adjoint += c_adjoint[0]
-b_adjoint += c_adjoint[0]
+b_adjoint += c_adjoint[1]
+```
 
+- TupleGetItem
+
+
+```python
 Before:
 b = a[0]
 
@@ -365,126 +387,24 @@ After:
 a_adjoint[0] += b_adjoint
 ```
 
-while we can 100% ensure `c_adjoint` and `a_adjoint` are two Tuples. But there are many accompanying problems.
+But if this AD is tuple-aware, then everything can be Tuple. For instance, in the above example, we can ensure some of them are Tuples but  `b_adjoint` can also be a Tuple. And every variable we meet can also be bound to a Tuple. So every operation (initialization, add, ...) should be tuple-aware. Luckily this can be solved elegantly by the nested_msg utils.
+
+The basic idea using nested_msg is that changing our previous `Map<Var, Expr> adjoint_expr_map_` to `Map<Var, NestedMsg<Expr>> adjoint_msg_map_`. And in the internal computing of AD, all elements we face are `NestedMsg<Expr>` thus we will not forget to handle tuple logic in some parts.
+
+Different Tuple operations need different NestMsg uitls. Here are some mainly logic appears in AD which should use NestedMsg.
 
 
 
-## Addition
+### N1: Addition
 
-If this AD is tuple-aware, then everything can be Tuple. For instance, in the above example, we can ensure some of them are Tuples but  `b_adjoint` can also be a Tuple. And every variable we meet can also be bound to a Tuple. 
+Addition is common in AD because every time we sum the partials up to get the final adjoint. From `Expr` to `Nested<Expr>`, we can't simply call `relax.add` since it only works for Tensor. But we can preserve it as the leaf operation, and use `CombineNestedMsg` to add two `Nested<Expr>`.
 
-The first and foremost problem is that in Relax, we can not simply use a call `relax.add` to add two Tuples together. 
-
-**Q:** But how can we indicate whether a var is bound to a Tuple or not? 
-
-**A:** We can check the type or shape of the var although it is complicated. But indeed in our AD we do not need to do this By observation, in our AD-Version 1, the only two places we use AD is the updating:
-
-```python
-adjoint_expr_map_[arg] += partial # call
-adjoint_expr_map_[b] += adjoint_var_map_[a] # assignment
-```
-
-Note that partial is generated by the gradient function, which will not be a variable bound to a Tuple. 
-
-And because `adjoint_var_map_[a]` is created in the AD, of course we know whether the corresponding expr (a.k.a `adjoint_expr_map_[a]`) is Tuple.
-
-Once we can know this, the next thing is we should extract a method to do such generalized addition. Because Tuple can be nested, here we need a recursion. This addition takes two arguments but it is not symmetrical.
-
-```python
-def Addition(base: Expr, increment: Expr):
-    if increment is Tuple:
-        ret = []
-        assert base is Tuple and len(base) == len(increment)
-        for i in len(base):
-            ret.append(Addition(base[i], increment[i]))
-    else:
-        return Call("relax.add", base, increment)
-```
-
-Note that `increment` can be `Tuple | Var | Expr` . Here `Var` brings some problems. Consider the following example:
-
-**E.g. 3.2:**
-
-```python
-@I.ir_module
-class Before:
-    @R.function
-    def main(x: Tuple(Tensor((5, 5), "float32"), Tensor((5, 5), "float32"))):
-        with R.dataflow():
-            lv0 = x
-            ...
-            R.output(gv0)
-        return gv0
-```
-
-In the first binding `lv0 = x`, we use `lv0_adjoint` to update `x_adjoint`. Since it is an assignment, we will do
-
-```python
-adjoint_expr_map_[x] = Addition(adjoint_expr_map_[x], lv0_adjoint)
-```
-
-This throws error since `lv0_adjoint` is a Var instead of a Tuple Expr.
-
-There are two ways to solve this. The first is checking the type or shape of the var to see whether it is a Tuple. If it is, then we use `TupleGetItem` and recursively do this until the type/shape is not TupleType/Tuple.
-
-```python
-def Addition(base: Expr, increment: Expr):
-    if increment is Tuple:
-        ret = []
-        assert base is Tuple and len(base) == len(increment)
-        for i in len(base):
-            ret.append(Addition(base[i], increment[i]))
-    else if increment is Var and type(increment) is TupleType:
-        ret = []
-        assert base is Tuple
-        for i in range(len(type(increment))):
-            ret.append(Addition(base[i], TupleGetItem(increment, i)))
-    else if increment is TupleGetItem:
-        ... 
-        # This case must be created in the above case.
-        # Do something to handle...
-    else:
-        return Call("relax.add", base, increment)
-```
-
-It is a bit complicated and we will see there is a simpler way. We agree on that when we call `Addition` we always pass `adjoint_expr` instead of `adjoint_var` to its second argument `increment`. This prevents the problem from happening. 
-
-But what about the "expr and var" issue (When we use an adjoint, we always use the adjoint var)? We can maintain a map from `adjoint_expr` to `adjoint_var` named `adjoint_expr_to_var_` and replace the expr with var in the last step of the addition.
-
-```python
-def Addition(base: Expr, increment: Expr):
-    if increment is Tuple:
-        ret = []
-        assert base is Tuple and len(base) == len(increment)
-        for i in len(base):
-            ret.append(Addition(base[i], increment[i]))
-        return Tuple(ret)
-    else:
-        return Call("relax.add", base, ReplaceExprByVar(increment))
-
-    
-def ReplaceExprByVar(expr: Expr):
-    if expr in adjoint_expr_to_var_:
-        return adjoint_expr_to_var_[expr]
-   	return expr # can not replace
-```
-
-And when we meet an assignment we just pass the `adjoint_expr`
-
-```python
-# a = b
-adjoint_expr_map_[b] = Addition(adjoint_expr_map_[b], adjointr_expr_map_[a])
-# If adjointr_expr_map_[a] is not a Tuple, it will be replaced with 
-# adjointr_var_map_[a] finally by ReplaceExprByVar.
-```
-
-Then we finally generalize our addition successfully.
+- NestedMsg util: `CombineNestedMsg`, which recursively combine two nested message into one.
+- `fcombine`: Tensor add (Call `relax.add`).
 
 
 
-## Deal With Tuple Definition
-
-Recall E.g. 3.1, we start by asking a few questions.
+### N2: Deal With Tuple Definition
 
 ```
 Before:
@@ -492,14 +412,16 @@ c = (a, b)
 
 After:
 a_adjoint += c_adjoint[0]
-b_adjoint += c_adjoint[0]
+b_adjoint += c_adjoint[1]
 ```
 
 **Q1:** Where does `c_adjoint` comes from? It is a tuple so where is this tuple created?
 
-**A1**:As mentioned in Section 2, an adjoint is created when it is firstly updated. As for the tensor case, when it is a first update, we replace `+=` by `=` and this skips the process of creation.
+**A1**:An adjoint is created when it is firstly updated. 
 
-But when it comes to Tuple, we can not just do these. `c_adjoint` is updated only when `c` is used and note that except the `Call` which takes Tuple as inputs, the only place a Tuple is used is `TupleGetItem`. So we can complete the above program
+- As for the tensor case, when it is a first update, we replace `+=` by `=` and this skips the process of creation.
+
+- But when it comes to Tuple, we can not just do these. `c_adjoint` is updated only when `c` is used.
 
 ```python
 Before:
@@ -511,91 +433,45 @@ After:
 c_adjoint[1] += e_adjoint # the first update!
 c_adjoint[0] += d_adjoint
 a_adjoint += c_adjoint[0]
-b_adjoint += c_adjoint[0]
+b_adjoint += c_adjoint[1]
 ```
 
-Then we can see the problem: the update for a Tuple adjoint is a **partial update**. So we must create an empty Tuple skeleton and then do partial update.
+Then we can see the problem: the update for a Tuple adjoint is a "partial update", which needs `c_adjoint[1]` to be a left value. But this is not supported in Relax semantic. Instead, we must create a "zeros Tuple" skeleton ahead and then do partial updates.
 
 ```python
-def BuildEmptyNestedTupleExpr(shape: Tuple, type: TupleType): # type is for "relax.zeros"
-    ret = []
-    for i in range(len(shape)):
-        if shape[i] is a Tuple:
-            ret.append(BuildEmptyNestedTupleExpr(shape[i], type[i]))
-        else:
-            assert shape[i] is ShapeExpr
-            ret.push_back(Call("relax.zeros", shape[i], type[i]))
-    return Tuple(ret)
+# Invalid: c_adjoint[i] can not be a leaf value
+c_adjoint[1] += e_adjoint
+c_adjoint[0] += d_adjoint
+
+# Valid: Build a "zeros Tuple" first, and use tuple-aware addition.
+c_adjoint = (0 + e_adjoint, 0 + d_adjoint)
 ```
+
+This "build zeros Tuple" method can be done by `MapToNestedMsg` util.
+
+- NestedMsg util: `MapToNestedMsg`, which maps struct info with possible nested-sinfo to nested message.
+- `fmapleaf`:  Call `relax.zeros`.
+
+
 
 **Q2:** What if the tuple is not updated completely after all partial updates?
 
-**A2:** This means these postions in Tuple are not used. According to the "Irrelevant Parts" section, we can just ignore them (Lettiing them be zeros is right!)
+**A2:** This means these postions in Tuple are not used. We can just ignore them. (Letting them be zeros is right!)
 
-After solving this, finally, we can start to propagate the adjoint. We can suppose the `adjoint_expr_map_[c]` is completely updated expr.
-
-```python
-if binding->value is Tuple:
-    adjoint_var = adjoint_var_map_[binding->var]
-    adjoint_expr = adjoint_expr_map_[binding->var]
-    
-    assert adjoint_expr is Tuple
-    assert len(binding->value) == len(adjoint_var)
-    
-    for i in range(len(binding->value)):
-		v = adjoint_expr[i] # Var
-        adjoint_expr_map_[v] = Addition(adjoint_expr_map_[v], 
-                                        TupleGetItem(adjoint_var, i))
-```
-
-Wait. Something seems wrong. We should be very very careful for each assumption. In this code,  we can not ensure `v = adjoint_expr[i]` is a variable since there exists nested tuple. So we need a recursive logic again here.
+After answering these two questions, we can now handle Tuple definition case well. Given that Tuple is a leaf node, it may present in the arguments of a Call. So we should update V1 `update_adjoint`  as a tuple-aware one, which can be simply done by `DecomposeNestedMsg`.
 
 ```python
-def UpdateExprMap(base: Expr, increment: Var):
-    if base is Var:
-        adjoint_expr_map_[base] = Addition(adjoint_expr_map_[v], increment)
-    else if base is Tuple:
-        for i in range(len(base)):
-            UpdateExprMap(base[i], TupleGetItem(increment, i))
+# t = (a, b), a, b are Tensors.
+update_adjoint(t, partial)
+# will call update_adjoint(t[0], partial) and update_adjoint(t[1], partial)
 ```
 
-Note that here the increment is Var due to the "expr and var" issue. It looks good but a problem hides. We can observe that here we pass a `TupleGetItem(Var, pos)` (or nested TupleGetItem) to Addition as its second argument, which is unacceptable. We can not tell whether a  `TupleGetItem(Var, pos)` is bound to a Tuple or not.
-
-Our temporary solution is ignoring the rule of "expr and var" issue for Tuples:
-
-```python
-def UpdateExprMap(base: Expr, increment: Expr):
-    if base is Var:
-        adjoint_expr_map_[base] = Addition(adjoint_expr_map_[v], increment)
-    else if base is Tuple:
-        for i in range(len(base)):
-            UpdateExprMap(base[i], increment[i])
-```
-
-Here the increment is no longer `adjoint_var` but  `adjoint_expr`. 
-
-This violates the principal mentioned in the "Expr and Var" section: We should always use an adjoint in the form of adjoint Var. To memorize and reuse the result of `increment`, we can emit a binding and update the map `adjoint_expr_to_var_` 
-
-```python
-def UpdateExprMap(base: Expr, increment: Expr):
-    if base is Var:
-        if increment in adjoint_expr_to_var_:
-            increment_var = adjoint_expr_to_var_[increment]
-        else:
-            increment_var = Var()
-            BindAndEmit(increment_var, increment)
-            adjoint_expr_to_var_[increment] = increment_var
-        adjoint_expr_map_[base] = Addition(adjoint_expr_map_[v], increment_var)
-    else if base is Tuple:
-        for i in range(len(base)):
-            UpdateExprMap(base[i], increment[i])
-```
+- NestedMsg util: `DecomposeNestedMsg`, which recursively decompose the tuple structure in expr and msg along with it.
+- `fcombine`: Tensor update in V1.
 
 
 
-## Deal With TupleGetItem
-
-Recall E.g. 3.1 and our discussion of the partial update
+### N3:  Deal With TupleGetItem
 
 ```
 Before:
@@ -605,78 +481,37 @@ After:
 a_adjoint[0] += b_adjoint
 ```
 
-We have explained that when it is a first-time update, we should call `BuildEmptyNestedTupleExpr` to build the whole skeleton of this adjoint Tuple first. 
+We should consider how to implement this partial update. The difficulty is in Relax `a_adjoint[0]` can not be a left-value. For a var binding, the left value should always be a variable. So we should do this manually by diving into the tuple. That is to say, we need implement a method `AddInTuple` which can do addition in a specific position of Tuple. 
 
-Next we should consider how to implement this partial update. The difficulty is in Relax `t[0]` can not be a left-value. For a var binding, the left value should always be a variable. So we should do this manually by diving into the tuple. That is to say, we need implement a method `AdditionInTuple` which can do addition in a specific position of Tuple.
+Recall that we use `NestedMsg<Expr>` to represent the adjoint expr, the implement should be like
 
-Recall that the TupleGetItem can not be nested, which is good news for us because we don't need recursive searching here. We can just scan the Tuple in its first layer:
-
-```python
-def AdditionInTuple(tuple: Tuple, pos: int, increment: Expr):
-	ret = []
-    for i in range(len(tuple)):
-        if i == index:
-            ret.append(Addition(tuple[i], increment)) # add in this position!
-        else:
-            ret.append(tuple[i]) # no change
-    return Tuple(ret)
-```
-
-And it is time to do the propagation
-
-```python
-if binding->value is TupleGetItem:
-    adjoint_var = adjoint_var_map_[binding->var] # b_adjoint
-    adjoint_expr = adjoint_expr_map_[binding->var] # b_adjoint_expr
-    
-    updated_tuple = binding->value->tuple
-    tuple_var = Downcast<Var>(updated_tuple) # a_adjoint
-    
-    if updated_tuple not in adjont_expr_map_: # first-time update
-        BuildEmptyNestedTuple(updated_tuple->shape, updated_tuple->checked_type)
-    
-    adjoint_expr_map_[tuple_var] = AdditionInTuple(
-        adjoint_expr_map_[tuple_var], # a_adjoint_expr: Tuple
-        binding->value->index, adjoint_expr)
+```cpp
+NestedMsg<Expr> AddInAdjointMsg(NestedMsg<Expr> adjoint, int pos, NestedMsg<Expr> increment) {
+	Array<AdjointMsg> arr = adjoint.NestedArray();
+    arr.Set(index, TupleAwareAdd(arr[index], increment));
+    return NestedMsg<Expr>(arr);
+}
 ```
 
 
 
-# Q&A of Some Logic
+### N4: Converting between NestedMsg and Tuple
 
-## UpdateExprMap and Addition
+We do adjoints calculation and propagation in the base of `NestedMsg<Expr>` internally. But our input/output is a Relax Module which use relax.Tuple for nested expr. Therefore the conversion is necessary.
 
-There is no duplicate logic in these two methods. (It looks like because they all have a recursively tuple-aware logic.)
+#### Tuple Expr to NestedMsg
 
-- UpdateExprMap is to deal with all leaves
+- NestedMsg util: `MapToNestedMsgBySInfo`. Similar with `MapToNestedMsg`, but using the struct info to decompose the expr.
+- `fmapleaf`:  Return the expr directly.
 
-  For a call `d = op(a, b, c)`, we should do
+#### NestedMsg to Tuple Expr
 
-  ```
-  UpdateExprMap(a, d_adjoint) 
-  UpdateExprMap(b, d_adjoint)
-  UpdateExprMap(c, d_adjoint)
-  ```
+- NestedMsg util: `NestedMsgToExpr`, which maps nested message back to the expr.
+- `fmapleaf`:  Put the leaf expr in a NestedMsg.
 
-  Here we don't know what is `a/b/c`. Under the assumption of normalization, it can be all relax leaf nodes.
 
-- Addition is just a tuple-aware AD (since `relax.add` does not support Tuple)
 
-## Expr and Var
+# 5. Constant
 
-To show the problem clearly, here is an example:
-
-```c++
-@I.ir_module
-class Before:
-    @R.function
-    def main(x: R.Tensor((3, 3), "float32")):
-        with R.dataflow():
-            lv1 = x
-            lv2 = R.add(lv1, x)
-            lv3 = R.add(lv2, lv1)
-            lv4 = R.sum(lv3)
-            R.output(lv4)
-        return lv4
-```
+For constant the strategy is very simple. Ignoring when meeting them is OK. Note that Constant is also a leaf node in Relax AST, extra checks should be added in `update_adjoint`.
 
